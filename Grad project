@@ -1,0 +1,433 @@
+
+from __future__ import annotations
+
+import re
+import sqlite3
+import threading
+import time
+import zlib
+from dataclasses import dataclass
+from typing import Optional, Protocol, Sequence
+
+import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+# Embedders
+# --------------------------------------------------------------------------- #
+class Embedder(Protocol):
+    name: str  # stored in the DB; vectors from different models never mix
+    dim: int
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        """Return an (n, dim) float32 array of L2-normalised vectors."""
+
+
+def _unit(x: np.ndarray) -> np.ndarray:
+    return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-12)
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
+class SentenceTransformerEmbedder:
+    """Real semantic embeddings (pip install sentence-transformers)."""
+
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        from sentence_transformers import SentenceTransformer
+
+        self._model = SentenceTransformer(model_name)
+        self.name = model_name
+        self.dim = int(self._model.get_sentence_embedding_dimension())
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        v = self._model.encode(list(texts), normalize_embeddings=True)
+        return np.asarray(v, dtype=np.float32)
+
+
+class HashingEmbedder:
+    """Dependency-free fallback: signed hashed character n-grams + words."""
+
+    def __init__(self, dim: int = 1024, ngrams=(3, 4, 5)):
+        self.dim, self.ngrams = dim, ngrams
+        self.name = f"hashing-{dim}-{''.join(map(str, ngrams))}"
+
+    def embed(self, texts: Sequence[str]) -> np.ndarray:
+        out = np.zeros((len(texts), self.dim), dtype=np.float32)
+        for i, t in enumerate(texts):
+            s = " " + _clean(t).lower() + " "
+            feats = [s[j:j + n] for n in self.ngrams for j in range(len(s) - n + 1)]
+            feats += ["w:" + w for w in s.split()]
+            for f in feats:
+                h = zlib.crc32(f.encode())
+                out[i, h % self.dim] += 1.0 if (h >> 31) & 1 else -1.0
+        return _unit(out)
+
+
+# --------------------------------------------------------------------------- #
+# Data types
+# --------------------------------------------------------------------------- #
+@dataclass
+class Category:
+    id: int
+    name: str
+    count: int  # how many vectors (name + absorbed examples) back the centroid
+
+
+@dataclass
+class Match:
+    category: Category
+    score: float
+
+
+@dataclass
+class Assignment:
+    status: str                 # "matched" | "created" | "no_match"
+    category: Optional[Category]
+    score: float                # cosine of best candidate (1.0 for created)
+    ambiguous: bool             # runner-up was within `ambiguity_margin`
+    candidates: list[Match]
+
+
+def _key(name: str) -> str:
+    return _clean(name).casefold()
+
+
+# --------------------------------------------------------------------------- #
+# Default seed categories
+# --------------------------------------------------------------------------- #
+DEFAULT_CATEGORIES = [
+    "Billing and payments",
+    "Technical support",
+    "Shipping and delivery",
+    "Account security",
+    "Research",
+    "Creating a CV/Resume",
+    "Languages: English, French, Arabic",
+    "Creating presentation",
+    "Programming",
+    "Python",
+    "C++",
+    "Java",
+    "JavaScript",
+    "Frontend development",
+    "Backend development",
+    ".NET",
+    "SQL",
+    "PowerBI",
+    "C#",
+    "Education",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Index
+# --------------------------------------------------------------------------- #
+class CategoryIndex:
+    def __init__(
+        self,
+        path: str = ":memory:",
+        embedder: Optional[Embedder] = None,
+        match_threshold: float = 0.55,       # >= this: text belongs to a category
+        duplicate_threshold: float = 0.85,   # >= this: new name is an alias, not a new category
+        absorb_threshold: float = 0.70,      # >= this (and unambiguous): learn from the text
+        ambiguity_margin: float = 0.03,
+        centroid_cap: int = 20,              # limits drift: old evidence weight never exceeds this
+    ):
+        if not duplicate_threshold >= match_threshold:
+            raise ValueError("duplicate_threshold must be >= match_threshold")
+        self.embedder = embedder or HashingEmbedder()
+        self.match_threshold = match_threshold
+        self.duplicate_threshold = duplicate_threshold
+        self.absorb_threshold = absorb_threshold
+        self.ambiguity_margin = ambiguity_margin
+        self.centroid_cap = centroid_cap
+
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._init_schema()
+        self._load()
+
+    # ---- persistence ------------------------------------------------------ #
+    def _init_schema(self) -> None:
+        self._db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS categories(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL, key TEXT NOT NULL UNIQUE,
+                vector BLOB NOT NULL, n INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS aliases(
+                key TEXT PRIMARY KEY, name TEXT NOT NULL,
+                category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE);
+            """
+        )
+        row = self._db.execute("SELECT value FROM meta WHERE key='embedder'").fetchone()
+        if row is None:
+            self._db.execute("INSERT INTO meta VALUES('embedder', ?)", (self.embedder.name,))
+            self._db.commit()
+        elif row[0] != self.embedder.name:
+            raise RuntimeError(
+                f"DB was built with embedder '{row[0]}' but '{self.embedder.name}' was given. "
+                "Open it with the original embedder, or call CategoryIndex.reembed()."
+            )
+
+    def _load(self) -> None:
+        dim = self.embedder.dim
+        rows = self._db.execute("SELECT id, name, vector, n FROM categories ORDER BY id").fetchall()
+        self._M = np.zeros((max(64, len(rows) * 2), dim), dtype=np.float32)
+        self._ids: list[int] = []
+        self._cats: dict[int, Category] = {}
+        self._by_key: dict[str, int] = {}
+        for id_, name, blob, n in rows:
+            self._append(Category(id_, name, n), np.frombuffer(blob, dtype=np.float32))
+        for key, cid in self._db.execute("SELECT key, category_id FROM aliases"):
+            self._by_key[key] = cid
+        self._by_key.update({_key(c.name): c.id for c in self._cats.values()})
+
+    # ---- matrix bookkeeping ---------------------------------------------- #
+    def _append(self, cat: Category, vec: np.ndarray) -> None:
+        if len(self._ids) == len(self._M):  # amortised O(1) growth
+            self._M = np.vstack([self._M, np.zeros_like(self._M)])
+        self._M[len(self._ids)] = vec
+        self._ids.append(cat.id)
+        self._cats[cat.id] = cat
+
+    def _row(self, cid: int) -> int:
+        return self._ids.index(cid)
+
+    def _drop_row(self, cid: int) -> None:
+        r, last = self._row(cid), len(self._ids) - 1
+        self._M[r] = self._M[last]  # swap-remove keeps the matrix dense
+        self._ids[r] = self._ids[last]
+        self._ids.pop()
+        del self._cats[cid]
+
+    # ---- public API ------------------------------------------------------- #
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def categories(self) -> list[Category]:
+        with self._lock:
+            return sorted(self._cats.values(), key=lambda c: c.id)
+
+    def get(self, name: str) -> Optional[Category]:
+        with self._lock:
+            cid = self._by_key.get(_key(name))
+            return self._cats.get(cid) if cid else None
+
+    def add_category(self, name: str, force: bool = False, _vec: Optional[np.ndarray] = None):
+        """Add a category. Returns (category, created).
+
+        If the name (or an alias) already exists, or is semantically a near
+        duplicate of an existing category, that category is returned with
+        created=False and the name is recorded as an alias. `force=True`
+        skips the semantic duplicate check.
+        """
+        name = _clean(name)
+        if not name:
+            raise ValueError("empty category name")
+        vec = _vec if _vec is not None else self.embedder.embed([name])[0]
+        with self._lock:
+            existing = self.get(name)
+            if existing:
+                return existing, False
+            if not force:
+                top = self._top(vec, 1)
+                if top and top[0].score >= self.duplicate_threshold:
+                    self._add_alias(top[0].category.id, name)
+                    return top[0].category, False
+            cur = self._db.execute(
+                "INSERT INTO categories(name, key, vector, n, created_at) VALUES(?,?,?,?,?)",
+                (name, _key(name), vec.astype(np.float32).tobytes(), 1, time.time()),
+            )
+            self._db.commit()
+            cat = Category(cur.lastrowid, name, 1)
+            self._append(cat, vec)
+            self._by_key[_key(name)] = cat.id
+            return cat, True
+
+    def seed(self, names=DEFAULT_CATEGORIES) -> list[Category]:
+        """Bulk-add curated categories. Returns the ones newly created.
+
+        Uses force=True so deliberately distinct but lexically similar names
+        (e.g. "Java" / "JavaScript", "C++" / "C#") are never folded together
+        by the near-duplicate check. Existing names are skipped (idempotent).
+        """
+        made = []
+        for n in names:
+            cat, created = self.add_category(n, force=True)
+            if created:
+                made.append(cat)
+        return made
+
+    def remove_category(self, name: str) -> bool:
+        with self._lock:
+            cat = self.get(name)
+            if not cat:
+                return False
+            self._db.execute("DELETE FROM aliases WHERE category_id=?", (cat.id,))
+            self._db.execute("DELETE FROM categories WHERE id=?", (cat.id,))
+            self._db.commit()
+            self._drop_row(cat.id)
+            self._by_key = {k: v for k, v in self._by_key.items() if v != cat.id}
+            return True
+
+    def merge(self, src: str, dst: str) -> Category:
+        """Fold category `src` into `dst`; src's name becomes an alias of dst."""
+        with self._lock:
+            s, d = self.get(src), self.get(dst)
+            if not s or not d or s.id == d.id:
+                raise ValueError("both categories must exist and differ")
+            vs, vd = self._M[self._row(s.id)], self._M[self._row(d.id)]
+            merged = _unit(vd * d.count + vs * s.count)
+            self._set_vector(d.id, merged, d.count + s.count)
+            self._db.execute("UPDATE aliases SET category_id=? WHERE category_id=?", (d.id, s.id))
+            self._db.execute("DELETE FROM categories WHERE id=?", (s.id,))
+            self._drop_row(s.id)
+            self._add_alias(d.id, s.name)
+            for k, v in list(self._by_key.items()):
+                if v == s.id:
+                    self._by_key[k] = d.id
+            return d
+
+    def search(self, text: str, k: int = 5) -> list[Match]:
+        """Top-k categories by cosine similarity (no side effects)."""
+        q = self.embedder.embed([_clean(text)])[0]
+        with self._lock:
+            return self._top(q, k)
+
+    def assign(
+        self,
+        text: str,
+        k: int = 5,
+        auto_create: bool = True,
+        learn: bool = True,
+        new_name: Optional[str] = None,
+    ) -> Assignment:
+        """Match text to a category; grow the category set when nothing fits.
+
+        auto_create: create a category from `new_name` (default: the text,
+            truncated) when the best score is below match_threshold.
+        learn: nudge the matched category's vector toward this text when the
+            match is confident and unambiguous.
+        """
+        text = _clean(text)
+        q = self.embedder.embed([text])[0]
+        with self._lock:
+            exact = self.get(text)
+            if exact:
+                return Assignment("matched", exact, 1.0, False, [Match(exact, 1.0)])
+            cands = self._top(q, k)
+            best = cands[0] if cands else None
+            if best and best.score >= self.match_threshold:
+                amb = len(cands) > 1 and best.score - cands[1].score < self.ambiguity_margin
+                if learn and not amb and best.score >= self.absorb_threshold:
+                    self._absorb(best.category, q)
+                return Assignment("matched", best.category, best.score, amb, cands)
+            if auto_create:
+                name = _clean(new_name or text)[:80]
+                cat, created = self.add_category(name, _vec=self.embedder.embed([name])[0])
+                return Assignment("created" if created else "matched", cat, 1.0, False, cands)
+            return Assignment("no_match", None, best.score if best else 0.0, False, cands)
+
+    def find_duplicates(self, threshold: Optional[float] = None) -> list[tuple[Category, Category, float]]:
+        """Category pairs whose vectors have drifted close - candidates for merge()."""
+        t = self.duplicate_threshold if threshold is None else threshold
+        with self._lock:
+            n = len(self._ids)
+            if n < 2:
+                return []
+            sims = self._M[:n] @ self._M[:n].T
+            iu, ju = np.triu_indices(n, k=1)
+            hit = sims[iu, ju] >= t
+            return sorted(
+                ((self._cats[self._ids[i]], self._cats[self._ids[j]], float(sims[i, j]))
+                 for i, j in zip(iu[hit], ju[hit])),
+                key=lambda x: -x[2],
+            )
+
+    def reembed(self, new_embedder: Embedder) -> None:
+        """Switch embedding model: re-embeds every category name (centroids reset)."""
+        with self._lock:
+            names = [c.name for c in self.categories()]
+            vecs = new_embedder.embed(names)
+            self.embedder = new_embedder
+            self._M = np.zeros((max(64, len(names) * 2), new_embedder.dim), dtype=np.float32)
+            old = self.categories()
+            self._ids, self._cats = [], {}
+            for c, v in zip(old, vecs):
+                c.count = 1
+                self._append(c, v)
+                self._db.execute("UPDATE categories SET vector=?, n=1 WHERE id=?",
+                                 (v.astype(np.float32).tobytes(), c.id))
+            self._db.execute("UPDATE meta SET value=? WHERE key='embedder'", (new_embedder.name,))
+            self._db.commit()
+
+    # ---- internals -------------------------------------------------------- #
+    def _top(self, q: np.ndarray, k: int) -> list[Match]:
+        n = len(self._ids)
+        if n == 0:
+            return []
+        scores = self._M[:n] @ q
+        k = min(k, n)
+        idx = np.argpartition(-scores, k - 1)[:k] if k < n else np.arange(n)
+        idx = idx[np.argsort(-scores[idx])]
+        return [Match(self._cats[self._ids[i]], float(scores[i])) for i in idx]
+
+    def _set_vector(self, cid: int, vec: np.ndarray, n: int) -> None:
+        self._M[self._row(cid)] = vec
+        self._cats[cid].count = n
+        self._db.execute("UPDATE categories SET vector=?, n=? WHERE id=?",
+                         (vec.astype(np.float32).tobytes(), n, cid))
+        self._db.commit()
+
+    def _absorb(self, cat: Category, q: np.ndarray) -> None:
+        w = min(cat.count, self.centroid_cap)
+        new = _unit(self._M[self._row(cat.id)] * w + q)
+        self._set_vector(cat.id, new, cat.count + 1)
+
+    def _add_alias(self, cid: int, name: str) -> None:
+        k = _key(name)
+        self._db.execute("INSERT OR REPLACE INTO aliases VALUES(?,?,?)", (k, name, cid))
+        self._db.commit()
+        self._by_key[k] = cid
+
+
+# --------------------------------------------------------------------------- #
+# Demo
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    try:
+        emb = SentenceTransformerEmbedder()
+        print("using", emb.name)
+        kw = {}
+    except Exception:
+        emb = HashingEmbedder()
+        print("sentence-transformers not available -> lexical HashingEmbedder fallback")
+        kw = dict(match_threshold=0.30, duplicate_threshold=0.80, absorb_threshold=0.45)
+
+    idx = CategoryIndex("categories.db" if False else ":memory:", emb, **kw)
+    idx.seed()
+    print(f"{len(idx)} categories seeded\n")
+
+    for t, nm in [
+        ("billing payment charged twice", None),
+        ("delivery of my package is late", None),
+        ("security problem with my account", None),
+        ("Do you sell gift cards?", "Gift cards"),   # nothing fits -> new category
+        ("Where can I buy a gift card?", None),      # should now hit the new one
+        ("help me write my resume cv", None),
+        ("python script to parse csv", None),
+        ("sql query with joins", None),
+        ("build a powerbi dashboard", None),
+        ("c++ pointers and memory", None),
+        ("translate this into french", None),
+    ]:
+        a = idx.assign(t, new_name=nm)
+        print(f"{a.status:8} {a.score:.2f}  {a.category.name!r:24} <- {t}")
+
+    print("\ncategories:", [c.name for c in idx.categories()])
+    print("possible duplicates:", [(a.name, b.name, round(s, 2)) for a, b, s in idx.find_duplicates(0.6)])
